@@ -1,4 +1,4 @@
-Selma
+🐍 Selma
 =====
 
 A terminal Snake implementation written in Haskell.
