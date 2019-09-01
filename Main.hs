@@ -17,6 +17,12 @@ import qualified Graphics.Vty as V
 import Brick.BChan
 import Brick.Util (on, fg, bg)
 import Data.Text.Markup ((@@))
+import Brick
+  ( hLimit
+  , padTop
+  , padBottom
+  , Padding(Pad)
+  )
 import Brick.Main
   ( App(..)
   , showFirstCursor
@@ -36,6 +42,7 @@ import Brick.Types
 import Brick.Markup (markup, (@?))
 import Brick.Widgets.Border (border, borderWithLabel)
 import Brick.Widgets.Border.Style (unicode)
+import Brick.Widgets.Center (center, hCenter)
 import Brick.Widgets.Core
   ( (<=>)
   , str
@@ -61,6 +68,7 @@ data State =
        , _stVelocity :: (Int, Int)
        , _stNextVelocity :: (Int, Int)
        , _stFoods :: [(Int, Int)]
+       , _stGameOver :: Bool
        }
 
 makeLenses ''State
@@ -82,15 +90,24 @@ drawUI st = [grid]
         grid =
           withBorderStyle unicode $
             borderWithLabel (str "Snake") $
-              vBox [
-                hBox [
-                  renderCell (x, y) st
-                  | x <- [0..width-1]] 
-                | y <- [0..width-1]
-              ]
-        lastEvent = case st^.stLastBrickEvent of
-          Just e -> show e
-          _ -> ""
+              if st^.stGameOver then drawGameOver else drawGame st
+
+drawGameOver =
+  hLimit (width * 2)
+  $ padTop (Pad (width `div` 2 - 1))
+  $ padBottom (Pad (width `div` 2 - 1))
+  $ vBox [
+    hCenter (str "Game over"),
+    hCenter (str "Press SPACE to start a new game")
+  ]
+
+drawGame st =
+  vBox [
+    hBox [
+      renderCell (x, y) st
+      | x <- [0..width-1]] 
+    | y <- [0..width-1]
+  ]
 
 move (dx,dy) (x,y) = ((x+dx) `mod` width, (y+dy) `mod` width)
 
@@ -107,6 +124,8 @@ potentiallyTurn currDirection direction
 
 isFoodEaten foods snakeHead = snakeHead `elem` foods
 
+isGoingToDie nextHeadPos snake = nextHeadPos `elem` snake
+
 -- Monad transformers
 loop st = do
   newFoodPos <- liftIO potentiallyRegenerateFood
@@ -114,11 +133,13 @@ loop st = do
                 & snake .~ newSnake
                 & stFoods .~ newFoodPos
                 & stVelocity .~ st^.stNextVelocity
+                & stGameOver .~ willDie
     where
         (oldSnakeHead:_) = st^.snake
         newSnakeHead = move (st^.stNextVelocity) oldSnakeHead
         eaten = isFoodEaten (st^.stFoods) newSnakeHead
         newSnake = moveSnake eaten newSnakeHead (st^.snake)
+        willDie = isGoingToDie newSnakeHead (st^.snake)
         potentiallyRegenerateFood
           | isFoodEaten (st^.stFoods) newSnakeHead = do
             coords <- generateRandomFreeCoords st
@@ -129,12 +150,15 @@ appEvent :: State -> BrickEvent () CustomEvent -> EventM () (Next State)
 appEvent st e =
     case e of
         VtyEvent (V.EvKey V.KEsc []) -> halt st
+        VtyEvent (V.EvKey (V.KChar ' ') []) -> do
+          newInitialState <- liftIO generateInitialState
+          continue $ newInitialState
         VtyEvent (V.EvKey V.KUp []) -> continue $ st & potentiallyTurn (st^.stVelocity) (0, -1)
         VtyEvent (V.EvKey V.KDown []) -> continue $ st & potentiallyTurn (st^.stVelocity) (0, 1)
         VtyEvent (V.EvKey V.KLeft []) -> continue $ st & potentiallyTurn (st^.stVelocity) (-1, 0)
         VtyEvent (V.EvKey V.KRight []) -> continue $ st & potentiallyTurn (st^.stVelocity) (1, 0)
         VtyEvent _ -> continue $ st & stLastBrickEvent .~ (Just e)
-        AppEvent Counter -> loop st
+        AppEvent Counter -> if (st^.stGameOver) then continue st else loop st
         _ -> continue st
 
 generateRandomCoords = do
@@ -143,7 +167,10 @@ generateRandomCoords = do
 
 generateRandomFreeCoords st = do
   let allItems = (st^.snake) ++ (st^.stFoods)
-  generateAndCheck allItems
+  generateRandomFreeCoordsExcept allItems
+
+generateRandomFreeCoordsExcept grids = do
+  generateAndCheck grids
   where
     generateAndCheck xs = do
       candidate <- generateRandomCoords
@@ -151,17 +178,18 @@ generateRandomFreeCoords st = do
     verifyCandidate xs x
       | x `elem` xs = generateAndCheck xs
       | otherwise = return x
-      
 
-initialState :: (Int, Int) -> State
-initialState randomPos =
-    State { _stLastBrickEvent = Nothing
-       , _stCounter = 0
-       , _snake = initialSnake
-       , _stVelocity = (1, 0)
-       , _stNextVelocity = (1, 0)
-       , _stFoods = [randomPos]
-       }
+generateInitialState :: IO State
+generateInitialState = do
+  randomPos <- generateRandomFreeCoordsExcept initialSnake
+  return $ State { _stLastBrickEvent = Nothing
+                 , _stCounter = 0
+                 , _snake = initialSnake
+                 , _stVelocity = (1, 0)
+                 , _stNextVelocity = (1, 0)
+                 , _stFoods = [randomPos]
+                 , _stGameOver = False
+                 }
 
 theApp :: App State CustomEvent ()
 theApp =
@@ -178,10 +206,10 @@ main = do
     x <- return (Just 10)
 
     forkIO $ forever $ do
-        threadDelay 200100
+        threadDelay 200000
         writeBChan chan Counter
 
     let buildVty = V.mkVty V.defaultConfig
     initialVty <- buildVty
-    randomPos <- generateRandomCoords
-    void $ customMain initialVty buildVty (Just chan) theApp (initialState randomPos)
+    iS <- generateInitialState
+    void $ customMain initialVty buildVty (Just chan) theApp iS
