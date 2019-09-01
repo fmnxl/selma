@@ -1,5 +1,10 @@
-Snake
+Selma
 =====
+
+A terminal Snake implementation written in Haskell.
+
+![alt text](https://github.com/freemanon/selma/raw/master/preview.gif "Selma")
+
 
 # Requirements
 
