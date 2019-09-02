@@ -3,10 +3,10 @@
 {-# LANGUAGE CPP #-}
 module Main where
 
+import Prelude hiding (Either, Left, Right)
 import Lens.Micro ((^.), (&), (.~), (%~))
 import Lens.Micro.TH (makeLenses)
 import Control.Monad (void, forever)
-import Control.Monad.Trans (lift)
 import Control.Monad.IO.Class (liftIO)
 import Control.Concurrent (threadDelay, forkIO)
 #if !(MIN_VERSION_base(4,11,0))
@@ -15,7 +15,7 @@ import Data.Monoid
 import qualified Graphics.Vty as V
 
 import Brick.BChan
-import Brick.Util (on, fg, bg)
+import Brick.Util (on, bg)
 import Data.Text.Markup ((@@))
 import Brick
   ( hLimit
@@ -40,34 +40,55 @@ import Brick.Types
   , BrickEvent(..)
   )
 import Brick.Markup (markup, (@?))
-import Brick.Widgets.Border (border, borderWithLabel)
+import Brick.Widgets.Border (borderWithLabel)
 import Brick.Widgets.Border.Style (unicode)
-import Brick.Widgets.Center (center, hCenter)
+import Brick.Widgets.Center (hCenter)
 import Brick.Widgets.Core
   ( (<=>)
   , str
   , vBox
   , hBox
-  , withAttr
   , withBorderStyle
   )
 import System.Random
+import Lib.Vector2
+import Lib.Direction
+
+-- Configs
+gameName = "Selma"
+width = 30 -- Screen width
+initialSnakeLength = 5
+
+addVector = createAddVectorModulo width
 
 data CustomEvent = Tick deriving Show
 
+data Snake =
+  Snake { _body :: [Vector2]
+        , _direction :: Direction
+        } deriving Show
+
+moveSnake :: Bool -> Direction -> [Vector2] -> [Vector2]
+moveSnake isEating direction (currHead:currTail) = nextHead:nextTail
+  where
+    nextHead = (directionVector direction) `addVector` currHead
+    nextTail | isEating = currHead:currTail 
+             | otherwise = currHead:(init currTail)
+
+isSnakeDead :: Snake -> Bool
+isSnakeDead (Snake { _body = body, _direction = direction }) = snakeHead `elem` snakeTail
+  where
+    (snakeHead:snakeTail) = body
+
 data State =
-  State { _stLastBrickEvent :: Maybe (BrickEvent () CustomEvent)
-        , _snake :: [(Int, Int)]
-        , _stVelocity :: (Int, Int)
-        , _stNextVelocity :: (Int, Int)
-        , _stFoods :: [(Int, Int)]
-        , _stGameOver :: Bool
-        }
+  State { _stSnake :: Snake
+        , _stNextDirection :: Direction
+        , _stFoods :: [Vector2]
+        , _stGameOverFlag :: Bool
+        } deriving Show
 
 makeLenses ''State
-
--- Screen width
-width = 30
+makeLenses ''Snake
 
 -- Infinite list of random ints
 randomInts :: IO [Int]
@@ -75,17 +96,14 @@ randomInts = do
   g <- newStdGen
   return $ randomRs (0, width - 2) g
 
-initialSnakeLength = 5
-initialSnake = reverse [(x,0) | x <- [0..initialSnakeLength]]
-
 drawUI :: State -> [Widget ()]
 drawUI st = [ui]
   where
-    ui =
-      withBorderStyle unicode $
-        borderWithLabel (str "Snake") $
-          if st^.stGameOver then drawGameOver else drawGame st
+    ui = withBorderStyle unicode $
+          borderWithLabel (str gameName) $
+            if st^.stGameOverFlag then drawGameOver else drawGame st
 
+drawGameOver :: Widget ()
 drawGameOver =
   hLimit (width * 2)
   $ padTop (Pad (width `div` 2 - 1))
@@ -95,6 +113,7 @@ drawGameOver =
     hCenter (str "Press SPACE to start a new game")
   ]
 
+drawGame :: State -> Widget ()
 drawGame st =
   vBox [
     hBox [
@@ -103,95 +122,102 @@ drawGame st =
     | y <- [0..width-1]
   ]
 
+drawGameCell :: Vector2 -> State -> Widget ()
 drawGameCell coords st
-  | coords `elem` st^.snake = cell V.blue
+  | coords `elem` st^.stSnake^.body = cell V.blue
   | coords `elem` st^.stFoods = cell V.red
   | otherwise = cell V.black
   where cell color = markup ("  " @@ bg color)
 
-move (dx,dy) (x,y) = ((x+dx) `mod` width, (y+dy) `mod` width)
+keyToDirection key = case key of
+  V.KUp -> Just Up
+  V.KDown -> Just Down
+  V.KLeft -> Just Left
+  V.KRight -> Just Right
+  _  -> Nothing
 
-moveSnake grow newHead (oldHead:oldTail) = newHead:oldHead:newTail
+updateGame :: State -> EventM () (Next State)
+updateGame st = do
+  stFoodsSetter <- liftIO $ createFoodsSetter
+  continue $ st
+    & stFoodsSetter
+    & stSnake %~ body %~ moveSnake isEatingFood (st^.stNextDirection)
+    & stSnake %~ direction .~ st^.stNextDirection
+    & \_st -> _st & stGameOverFlag .~ isSnakeDead (_st^.stSnake)
   where
-    newTail = if grow then oldTail else init oldTail
+    (currSnakeHead:_) = st^.stSnake^.body
+    snakeLookahead = (directionVector (st^.stNextDirection)) `addVector` currSnakeHead
+    isEatingFood = snakeLookahead `elem` (st^.stFoods)
+    createFoodsSetter
+      | isEatingFood = do
+        coords <- generateRandomFreeCell st
+        return $ stFoods .~ [coords]
+      | otherwise = return id
 
-opposite_direction (x, y) = (-x, -y)
+changeDirectionConditionally :: Direction -> State -> (State -> State)
+changeDirectionConditionally nextDirection st
+  | (st^.stSnake^.direction) `isOppositeOf` nextDirection = id
+  | otherwise = stNextDirection .~ nextDirection
 
-potentiallyTurn currDirection direction
-  | currDirection == opposite_direction(direction) = id
-  | otherwise = stNextVelocity .~ direction
-
-isFoodEaten foods snakeHead = snakeHead `elem` foods
-
-isGoingToDie nextHeadPos snake = nextHeadPos `elem` snake
-
--- Monad transformers
-loop st = do
-  newFoodPos <- liftIO potentiallyRegenerateFood
-  continue $ st & snake .~ newSnake
-                & stFoods .~ newFoodPos
-                & stVelocity .~ st^.stNextVelocity
-                & stGameOver .~ willDie
+handleKeyEvent :: V.Key -> State -> EventM () (Next State)
+handleKeyEvent key st
+  | key == V.KEsc = quitGame
+  | key == (V.KChar ' ') = restartGame
+  | Just direction <- keyToDirection key = continue $ st
+    & changeDirectionConditionally direction st
+  | otherwise = continue st
   where
-    (oldSnakeHead:_) = st^.snake
-    newSnakeHead = move (st^.stNextVelocity) oldSnakeHead
-    eaten = isFoodEaten (st^.stFoods) newSnakeHead
-    newSnake = moveSnake eaten newSnakeHead (st^.snake)
-    willDie = isGoingToDie newSnakeHead (st^.snake)
-    potentiallyRegenerateFood
-      | isFoodEaten (st^.stFoods) newSnakeHead = do
-        coords <- generateRandomFreeCoords st
-        return [coords]
-      | otherwise = return (st^.stFoods)
+    quitGame = halt st
+    restartGame = do
+      newInitialState <- liftIO generateInitialState
+      continue $ newInitialState
 
 appEvent :: State -> BrickEvent () CustomEvent -> EventM () (Next State)
 appEvent st e =
   case e of
-    VtyEvent (V.EvKey V.KEsc []) -> halt st
-    VtyEvent (V.EvKey (V.KChar ' ') []) -> do
-      newInitialState <- liftIO generateInitialState
-      continue $ newInitialState
-    VtyEvent (V.EvKey V.KUp []) -> continue $ st & potentiallyTurn (st^.stVelocity) (0, -1)
-    VtyEvent (V.EvKey V.KDown []) -> continue $ st & potentiallyTurn (st^.stVelocity) (0, 1)
-    VtyEvent (V.EvKey V.KLeft []) -> continue $ st & potentiallyTurn (st^.stVelocity) (-1, 0)
-    VtyEvent (V.EvKey V.KRight []) -> continue $ st & potentiallyTurn (st^.stVelocity) (1, 0)
-    VtyEvent _ -> continue $ st & stLastBrickEvent .~ (Just e)
-    AppEvent Tick -> if (st^.stGameOver) then continue st else loop st
+    VtyEvent (V.EvKey key []) -> handleKeyEvent key st
+    AppEvent Tick | st^.stGameOverFlag -> continue st
+                  | otherwise -> updateGame st
     _ -> continue st
 
-generateRandomCoords = do
+generateRandomVector :: IO Vector2
+generateRandomVector = do
   [x,y] <- randomInts >>= \x -> return $ take 2 $ x
   return (x,y)
 
-generateRandomFreeCoords st = do
-  let allItems = (st^.snake) ++ (st^.stFoods)
-  generateRandomFreeCoordsExcept allItems
+generateRandomFreeCell :: State -> IO Vector2
+generateRandomFreeCell st = do
+  let occupiedCells = (st^.stSnake^.body) ++ (st^.stFoods)
+  generateRandomFreeCellExcept occupiedCells
 
-generateRandomFreeCoordsExcept grids = do
-  generateAndCheck grids
+generateRandomFreeCellExcept :: [Vector2] -> IO Vector2
+generateRandomFreeCellExcept cells = do
+  candidate <- generateRandomVector
+  verifyCandidate cells candidate
   where
-    generateAndCheck xs = do
-      candidate <- generateRandomCoords
-      verifyCandidate xs candidate
-    verifyCandidate xs x
-      | x `elem` xs = generateAndCheck xs
+    verifyCandidate cells x
+      | x `elem` cells = generateRandomFreeCellExcept cells
       | otherwise = return x
 
 generateInitialState :: IO State
 generateInitialState = do
-  randomPos <- generateRandomFreeCoordsExcept initialSnake
-  return $ State { _stLastBrickEvent = Nothing
-                 , _snake = initialSnake
-                 , _stVelocity = (1, 0)
-                 , _stNextVelocity = (1, 0)
+  randomPos <- generateRandomFreeCellExcept initialSnakeBody
+  return $ State { _stSnake = initialSnake
+                 , _stNextDirection = initialSnake^.direction
                  , _stFoods = [randomPos]
-                 , _stGameOver = False
+                 , _stGameOverFlag = False
                  }
+  where
+    initialSnakeBody = reverse [(x,0) | x <- [0..initialSnakeLength]]
+    initialSnake =
+      Snake { _body = initialSnakeBody
+            , _direction = Right
+            }
 
-theApp :: App State CustomEvent ()
-theApp =
+app :: App State CustomEvent ()
+app =
   App { appDraw = drawUI
-      , appChooseCursor = showFirstCursor -- what this?
+      , appChooseCursor = showFirstCursor
       , appHandleEvent = appEvent
       , appStartEvent = return
       , appAttrMap = const $ attrMap V.defAttr []
@@ -208,5 +234,5 @@ main = do
 
   let buildVty = V.mkVty V.defaultConfig
   initialVty <- buildVty
-  iS <- generateInitialState
-  void $ customMain initialVty buildVty (Just chan) theApp iS
+  initialState <- generateInitialState
+  void $ customMain initialVty buildVty (Just chan) app initialState
